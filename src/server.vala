@@ -1685,6 +1685,8 @@ class Vls.Server : Object {
             }
 
             Vala.CodeNode result = get_best (fs, doc);
+            Vala.Symbol symbol;
+
             var json_array = new Json.Array ();
             var references = new Gee.ArrayList<Vala.CodeNode> ();
 
@@ -1703,37 +1705,38 @@ class Vls.Server : Object {
                 reply_null (id, client, method);
                 Vala.CodeContext.pop ();
                 return;
+            } else {
+                symbol = (Vala.Symbol) result;
             }
 
             // show references in all files
-            foreach (var file in compilation.get_project_files ()) {
-                FindSymbol fs2;
-                if (is_abstract_type) {
-                    fs2 = new FindSymbol.with_filter (file, result,
-                    (needle, node) => {
-                        if (node is Vala.Class) {
-                            foreach (Vala.DataType dt in ((Vala.Class) node).get_base_types ())
-                                if (dt.type_symbol == needle)
-                                    return true;
-                        } else if (node is Vala.Interface) {
-                            foreach (Vala.DataType dt in ((Vala.Interface) node).get_prerequisites ())
-                                if (dt.type_symbol == needle)
-                                    return true;
-                        }
-                        return false;
-                    });
-                } else if (is_abstract_or_virtual_method) {
-                    fs2 = new FindSymbol.with_filter (file, result,
-                    (needle, node) => needle != node && (node is Vala.Method) && 
-                        (((Vala.Method)node).base_method == needle ||
-                         ((Vala.Method)node).base_interface_method == needle));
-                } else {
-                    fs2 = new FindSymbol.with_filter (file, result,
-                    (needle, node) => needle != node && (node is Vala.Property) &&
-                        (((Vala.Property)node).base_property == needle ||
-                         ((Vala.Property)node).base_interface_property == needle));
+            var generated_vapis = new HashSet<File> (Util.file_hash, Util.file_equal);
+            foreach (var btarget in selected_project.get_compilations ())
+                generated_vapis.add_all (btarget.output);
+            foreach (var btarget_w_sym in Server.get_compilations_using_symbol (selected_project, symbol)) {
+                foreach (var file in btarget_w_sym.first.get_project_files ()) {
+                    // don't show symbol from generated VAPI
+                    if (File.new_for_commandline_arg (file.filename) in generated_vapis)
+                        continue;
+
+                    FindSymbol fs2;
+                    if (is_abstract_type) {
+                        fs2 = new FindSymbol.with_filter (file, btarget_w_sym.second,
+                        (needle, node) => node is Vala.ObjectTypeSymbol && 
+                            ((Vala.ObjectTypeSymbol)node).is_subtype_of ((Vala.ObjectTypeSymbol) needle), false);
+                    } else if (is_abstract_or_virtual_method) {
+                        fs2 = new FindSymbol.with_filter (file, btarget_w_sym.second,
+                        (needle, node) => needle != node && (node is Vala.Method) && 
+                            (((Vala.Method)node).base_method == needle ||
+                            ((Vala.Method)node).base_interface_method == needle), false);
+                    } else {
+                        fs2 = new FindSymbol.with_filter (file, symbol,
+                        (needle, node) => needle != node && (node is Vala.Property) &&
+                            (((Vala.Property)node).base_property == needle ||
+                            ((Vala.Property)node).base_interface_property == needle), false);
+                    }
+                    references.add_all (fs2.result);
                 }
-                references.add_all (fs2.result);
             }
 
             debug (@"[$method] found $(references.size) reference(s)");
