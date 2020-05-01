@@ -1,4 +1,5 @@
 using LanguageServer;
+using Gee;
 
 /**
  * A backwards parser that makes extraordinary attempts to find the current
@@ -8,20 +9,88 @@ class Vls.SymbolExtractor : Object {
     /**
      * Represents a fake expression that the SE extracted.
      */
-    class FakeExpr {
+    abstract class FakeExpr {
+        public FakeExpr? inner { get; private set; }
+
+        protected FakeExpr (FakeExpr? inner) {
+            this.inner = inner;
+        }
+
+        public abstract string to_string ();
+    }
+
+    class FakeMemberAccess : FakeExpr {
         public string member_name { get; private set; }
-        public int method_arguments { get; private set; }
-        public bool is_methodcall {
-            get { return method_arguments >= 0; }
-        }
 
-        public FakeExpr (string member_name, int method_arguments = -1) {
+        public FakeMemberAccess (string member_name, FakeExpr? inner = null) {
+            base (inner);
             this.member_name = member_name;
-            this.method_arguments = method_arguments;
         }
 
-        public string to_string () {
-            return member_name + (is_methodcall ? @" ([$method_arguments arg(s)])" : "");
+        public override string to_string () {
+            if (inner != null)
+                return @"$inner.$member_name";
+            return member_name;
+        }
+    }
+
+    class FakeMethodCall : FakeExpr {
+        public int arguments_count { get; private set; }
+        public FakeMemberAccess member_access {
+            get { return (FakeMemberAccess) inner; }
+        }
+
+        public FakeMethodCall (int arguments_count, FakeMemberAccess member_access) {
+            base (member_access);
+            this.arguments_count = arguments_count;
+        }
+
+        public override string to_string () {
+            return @"$member_access ([$arguments_count arg(s)])";
+        }
+    }
+
+    class FakeObjectCreationExpr : FakeExpr {
+        private FakeObjectCreationExpr () { base (null); }
+
+        public FakeObjectCreationExpr.with_method_call (FakeMethodCall method_call) {
+            base (method_call);
+        }
+
+        public FakeObjectCreationExpr.with_member_access (FakeMemberAccess member_access) {
+            base (member_access);
+        }
+
+        public override string to_string () {
+            return @"new $inner";
+        }
+    }
+
+    class FakeEmptyExpr : FakeExpr {
+        public FakeEmptyExpr () {
+            base (null);
+        }
+
+        public override string to_string () {
+            return "<empty>";
+        }
+    }
+
+    abstract class FakeLiteral : FakeExpr {
+        public string value { get; private set; }
+        protected FakeLiteral (string value) {
+            base (null);
+            this.value = value;
+        }
+    }
+
+    class FakeStringLiteral : FakeLiteral {
+        public FakeStringLiteral (string value) {
+            base (value);
+        }
+
+        public override string to_string () {
+            return @"\"$value\"";
         }
     }
 
@@ -30,16 +99,6 @@ class Vls.SymbolExtractor : Object {
     public Vala.Symbol block { get; private set; }
     private Vala.SourceFile source_file;
     private Vala.CodeContext context;
-
-    private bool attempted_extract_string;
-    private string? _extracted_string;
-    public string extracted_string {
-        get {
-            if (_extracted_string == null && !attempted_extract_string)
-                compute_extracted_string ();
-            return _extracted_string;
-        }
-    }
 
     private bool attempted_extract_expression;
     private Vala.Expression? _extracted_expression;
@@ -50,6 +109,7 @@ class Vls.SymbolExtractor : Object {
             return _extracted_expression;
         }
     }
+
 
 #if !VALA_FEATURE_INITIAL_ARGUMENT_COUNT
     /**
@@ -82,21 +142,21 @@ class Vls.SymbolExtractor : Object {
         else if (closest_block is Vala.Method)
             actual_block = ((Vala.Method) closest_block).body;
         else {
-            var member = lookup_symbol_member (closest_block, variable_name);
+            var member = Vala.SemanticAnalyzer.symbol_lookup_inherited (closest_block, variable_name);
             if (member != null)
                 return new Pair<Vala.Symbol, Vala.Symbol> (member, closest_block);
             // try base types
             if (closest_block is Vala.Class) {
                 var cl = (Vala.Class) closest_block;
                 foreach (var base_type in cl.get_base_types ()) {
-                    member = lookup_symbol_member (base_type.type_symbol, variable_name);
+                    member = Vala.SemanticAnalyzer.symbol_lookup_inherited (base_type.type_symbol, variable_name);
                     if (member != null)
                         return new Pair<Vala.Symbol, Vala.Symbol> (member, closest_block);
                 }
             } else if (closest_block is Vala.Interface) {
                 var iface = (Vala.Interface) closest_block;
                 foreach (var prereq_type in iface.get_prerequisites ()) {
-                    member = lookup_symbol_member (prereq_type.type_symbol, variable_name);
+                    member = Vala.SemanticAnalyzer.symbol_lookup_inherited (prereq_type.type_symbol, variable_name);
                     if (member != null)
                         return new Pair<Vala.Symbol, Vala.Symbol> (member, closest_block);
                 }
@@ -119,108 +179,11 @@ class Vls.SymbolExtractor : Object {
             // otherwise, as a final attempt, look in the imported using directives
             foreach (var ud in source_file.current_using_directives) {
                 var ns = (Vala.Namespace) ud.namespace_symbol;
-                var member = lookup_symbol_member (ns, variable_name);
+                var member = Vala.SemanticAnalyzer.symbol_lookup_inherited (ns, variable_name);
 
                 if (member != null)
                     return new Pair<Vala.Symbol, Vala.Symbol> (member, ns);
             }
-        }
-
-        return null;
-    }
-
-    static Vala.DataType? get_data_type (Vala.Symbol sym) {
-        if (sym is Vala.Variable) {
-            return ((Vala.Variable) sym).variable_type;
-        } else if (sym is Vala.Property) {
-            return ((Vala.Property) sym).property_type;
-        }
-        return null;
-    }
-
-    static Vala.Symbol? lookup_symbol_member (Vala.Symbol container, string member_name) {
-        if (container is Vala.Namespace) {
-            var ns = (Vala.Namespace) container;
-
-            foreach (var cl in ns.get_classes ())
-                if (cl.name == member_name)
-                    return cl;
-
-            foreach (var cnst in ns.get_constants ())
-                if (cnst.name == member_name)
-                    return cnst;
-
-            foreach (var delg in ns.get_delegates ())
-                if (delg.name == member_name)
-                    return delg;
-
-            foreach (var en in ns.get_enums ())
-                if (en.name == member_name)
-                    return en;
-
-            foreach (var err in ns.get_error_domains ())
-                if (err.name == member_name)
-                    return err;
-
-            foreach (var field in ns.get_fields ())
-                if (field.name == member_name)
-                    return field;
-
-            foreach (var iface in ns.get_interfaces ())
-                if (iface.name == member_name)
-                    return iface;
-
-            foreach (var m in ns.get_methods ())
-                if (m.name == member_name)
-                    return m;
-
-            foreach (var n in ns.get_namespaces ())
-                if (n.name == member_name)
-                    return n;
-
-            foreach (var st in ns.get_structs ())
-                if (st.name == member_name)
-                    return st;
-        } else if (container is Vala.ObjectTypeSymbol) {
-            var ots = (Vala.ObjectTypeSymbol) container;
-
-            foreach (var cl in ots.get_classes ())
-                if (cl.name == member_name)
-                    return cl;
-
-            foreach (var cotst in ots.get_constants ())
-                if (cotst.name == member_name)
-                    return cotst;
-
-            foreach (var delg in ots.get_delegates ())
-                if (delg.name == member_name)
-                    return delg;
-
-            foreach (var en in ots.get_enums ())
-                if (en.name == member_name)
-                    return en;
-
-            foreach (var field in ots.get_fields ())
-                if (field.name == member_name)
-                    return field;
-
-            foreach (var iface in ots.get_interfaces ())
-                if (iface.name == member_name)
-                    return iface;
-
-            foreach (var m in ots.get_methods ())
-                if (m.name == member_name)
-                    return m;
-
-            foreach (var p in ots.get_properties ())
-                if (p.name == member_name)
-                    return p;
-
-            // signals can't be static
-
-            foreach (var st in ots.get_structs ())
-                if (st.name == member_name)
-                    return st;
         }
 
         return null;
@@ -233,136 +196,166 @@ class Vls.SymbolExtractor : Object {
             return new Vala.SignalType ((Vala.Signal) callable);
         if (callable is Vala.DelegateType)
             return new Vala.DelegateType ((Vala.Delegate) callable);
-        warning ("unknown Callable node %s", callable.type_name);
+        critical ("unknown Callable node %s", callable.type_name);
         return null;
     }
 
-    private Queue<FakeExpr> compute_extracted_string (bool allow_parse_as_method_call = true) {
-        var queue = new Queue<FakeExpr> ();
+    private Vala.Expression resolve_typed_expression (FakeExpr fake_expr) throws TypeResolutionError {
+        if (fake_expr is FakeMemberAccess) {
+            var fake_ma = (FakeMemberAccess) fake_expr;
+            if (fake_ma.inner == null) {
+                // attempt to resolve first expression
+                Vala.Symbol? current_block = block;
+                Vala.Symbol? resolved_sym = null;
 
-        skip_whitespace ();
-        bool is_member_access = skip_member_access ();
-        skip_whitespace ();
-        for (FakeExpr? expr = null; (expr = parse_fake_expr (queue.is_empty () && 
-                                                             !is_member_access &&
-                                                             allow_parse_as_method_call)) != null; ) {
-            queue.push_head (expr);
-            // debug ("got fake expression `%s'", expr.to_string ());
-            skip_whitespace ();
-            if (!skip_member_access ())
-                break;
-            skip_whitespace ();
+                while (current_block != null &&
+                        current_block.scope != null &&
+                        resolved_sym == null) {
+                    resolved_sym = current_block.scope.lookup (fake_ma.member_name);
+                    if (resolved_sym == null) {
+                        var symtab = current_block.scope.get_symbol_table ();
+                        if (symtab != null && symtab.contains (fake_ma.member_name)) {
+                            // found first part in symbol table, but the symbol was null
+                            break;
+                        }
+                        current_block = current_block.parent_symbol;
+                    }
+                }
+
+                if (resolved_sym == null) {
+                    // perform exhaustive search
+                    var pair = find_variable_visible_in_block (fake_ma.member_name, current_block ?? block);
+                    if (pair != null) {
+                        resolved_sym = pair.first;
+                    }
+                }
+
+                if (resolved_sym == null) {
+                    throw new TypeResolutionError.FIRST_EXPRESSION ("could not resolve symbol `%s'", fake_ma.member_name);
+                }
+
+                var expr = new Vala.MemberAccess (null, fake_ma.member_name);
+                expr.symbol_reference = resolved_sym;
+                if (resolved_sym is Vala.Variable)
+                    expr.value_type = ((Vala.Variable)resolved_sym).variable_type;
+                else if (resolved_sym is Vala.Property)
+                    expr.value_type = ((Vala.Property)resolved_sym).property_type;
+                else if (resolved_sym is Vala.Callable)
+                    expr.value_type = get_callable_type_for_callable ((Vala.Callable)resolved_sym);
+                return expr;
+            } else {
+                Vala.Expression inner = resolve_typed_expression (fake_ma.inner);
+                Vala.Symbol? symbol;
+                if (inner.value_type != null) {
+                    symbol = Vala.SemanticAnalyzer.get_symbol_for_data_type (inner.value_type);
+                    if (symbol == null)
+                        throw new TypeResolutionError.NTH_EXPRESSION ("could not get symbol for inner data type");
+                } else {
+                    symbol = inner.symbol_reference;
+                    if (symbol == null)
+                        throw new TypeResolutionError.NTH_EXPRESSION ("inner expr `%s' has no symbol reference", inner.to_string ());
+                }
+                Vala.Symbol? member = Vala.SemanticAnalyzer.symbol_lookup_inherited (symbol, fake_ma.member_name);
+                if (member == null)
+                    throw new TypeResolutionError.NTH_EXPRESSION ("could not resolve member `%s' from inner", fake_ma.member_name);
+                var expr = new Vala.MemberAccess (inner, fake_ma.member_name);
+                expr.symbol_reference = member;
+                if (member is Vala.Variable)
+                    expr.value_type = ((Vala.Variable)member).variable_type;
+                else if (member is Vala.Property)
+                    expr.value_type = ((Vala.Property)member).property_type;
+                else if (member is Vala.Callable)
+                    expr.value_type = get_callable_type_for_callable ((Vala.Callable)member);
+                return expr;
+            }
+        } else if (fake_expr is FakeMethodCall) {
+            var fake_mc = (FakeMethodCall) fake_expr;
+            Vala.Expression call = resolve_typed_expression (fake_mc.inner);
+            var expr = new Vala.MethodCall (call);
+            Vala.Callable? callable;
+            if (call.value_type != null) {
+                callable = Vala.SemanticAnalyzer.get_symbol_for_data_type (call.value_type) as Vala.Callable;
+                if (callable == null)
+                    throw new TypeResolutionError.NTH_EXPRESSION ("could not get callable symbol for inner data type");
+            } else {
+                callable = call.symbol_reference as Vala.Callable;
+                // callable symbol may be null if we're in an OCE
+            }
+            if (callable != null)
+                expr.value_type = callable.return_type;
+#if VALA_FEATURE_INITIAL_ARGUMENT_COUNT
+            expr.initial_argument_count = fake_mc.arguments_count;
+#endif
+            return expr;
+        } else if (fake_expr is FakeObjectCreationExpr) {
+            var fake_oce = (FakeObjectCreationExpr) fake_expr;
+            Vala.Expression inner = resolve_typed_expression ((!) fake_oce.inner);
+            if (fake_oce.inner is FakeMethodCall) {
+                var inner_ma = (Vala.MemberAccess) ((Vala.MethodCall) inner).call;
+                var inner_sym = inner_ma.symbol_reference;
+                var expr = new Vala.ObjectCreationExpression (inner_ma);
+                if (inner_sym is Vala.Class) {
+                    expr.value_type = Vala.SemanticAnalyzer.get_data_type_for_symbol (inner_sym);
+                    expr.symbol_reference = ((Vala.Class)inner_sym).default_construction_method;
+                } else if (inner_sym is Vala.Method) {
+                    if (!(inner_sym is Vala.CreationMethod))
+                        throw new TypeResolutionError.NTH_EXPRESSION ("OCE: inner expr not CreationMethod");
+                    expr.value_type = Vala.SemanticAnalyzer.get_data_type_for_symbol (inner_sym.parent_symbol);
+                    expr.symbol_reference = inner_sym;
+                } else {
+                    throw new TypeResolutionError.NTH_EXPRESSION ("OCE: inner expr neither Class nor method");
+                }
+#if VALA_FEATURE_INITIAL_ARGUMENT_COUNT
+                expr.initial_argument_count = ((FakeMethodCall)fake_oce.inner).arguments_count;
+#endif
+                return expr;
+            } else {
+                // inner is Vala.MemberAccess
+                // this is an incomplete MA
+                return new Vala.ObjectCreationExpression ((Vala.MemberAccess) inner);
+            }
+        } else if (fake_expr is FakeLiteral) {
+            var fake_str = (FakeStringLiteral) fake_expr;
+            var expr = new Vala.StringLiteral (fake_str.value);
+            expr.value_type = context.analyzer.string_type;
+            return expr;
         }
-
-        attempted_extract_string = true;
-
-        _extracted_string = "";
-        for (unowned List<FakeExpr> node = queue.head; node != null; node = node.next)
-            _extracted_string += node.data.to_string ();
-
-        return queue;
+        assert_not_reached ();
     }
 
-    private void compute_extracted_expression (bool allow_parse_as_method_call = true) {
-        var queue = compute_extracted_string (allow_parse_as_method_call);
+    private void compute_extracted_expression (bool accept_within_method_call = true) {
+        // skip first member access
+        skip_whitespace ();
+        skip_member_access ();
+        skip_whitespace ();
+        // check lookup was successful
+        FakeExpr? expr = parse_fake_expr (accept_within_method_call, true);
+
         attempted_extract_expression = true;
 
-        // check lookup was successful
-        if (queue.length == 0) {
+        if (expr == null)
             return;
-        }
-
-        // 1. find symbol coresponding to first component
-        // 2. with the first symbol found, generate member accesses
-        //    for additional components
-        // 3. resolve the member accesses, and get the symbol_reference
-
-        FakeExpr first_part = queue.pop_head ();
-        Vala.Symbol? current_block = block;
-        Vala.Symbol? head_sym = null;
-        bool might_exist = false;
-        while (current_block != null &&
-               current_block.scope != null && 
-               head_sym == null) {
-            head_sym = current_block.scope.lookup (first_part.member_name);
-            if (head_sym == null) {
-                var symtab = current_block.scope.get_symbol_table ();
-                if (symtab != null && symtab.contains (first_part.member_name)) {
-                    // found first part in symbol table, but the symbol was null
-                    // exit this loop early and go to the other measure
-                    might_exist = true;
-                    break;
-                }
-                current_block = current_block.parent_symbol;
-            }
-        }
-
-        Vala.Symbol? container = context.root;
-        if (head_sym == null) {
-            // perform exhaustive search within current_block or block
-            var pair = find_variable_visible_in_block (first_part.member_name, current_block ?? block);
-            if (pair != null) {
-                head_sym = pair.first;
-                container = pair.second;
-            }
-        }
-
-        if (head_sym == null) {
-            // try again
-            if (allow_parse_as_method_call)
+        
+        debug ("extracted expression - %s", expr.to_string ());
+        
+        try {
+            _extracted_expression = resolve_typed_expression (expr);
+            debug ("resolved expression - %s", _extracted_expression.type_name);
+        } catch (TypeResolutionError e) {
+            if (e is TypeResolutionError.FIRST_EXPRESSION && accept_within_method_call) {
+                // try again, because a method call may be ambiguous in the case of
+                // an expression like `if (<expr>)`
+                debug ("retrying...");
                 compute_extracted_expression (false);
-            return;
-        }
-
-        context.analyzer.current_symbol = container;
-
-        Vala.Expression ma = new Vala.MemberAccess (null, first_part.member_name);
-        ma.symbol_reference = head_sym;
-        Vala.DataType? current_data_type;
-
-        if (first_part.is_methodcall && head_sym is Vala.Callable) {
-            current_data_type = ((Vala.Callable) head_sym).return_type;
-            ma = new Vala.MethodCall (ma);
-            ma.value_type = current_data_type;
-            ((Vala.MethodCall)ma).call.value_type = get_callable_type_for_callable ((Vala.Callable) head_sym);
-        } else {
-            current_data_type = get_data_type (head_sym);
-        }
-
-#if !VALA_FEATURE_INITIAL_ARGUMENT_COUNT
-        this.method_arguments = first_part.method_arguments;
-#endif
-
-        while (!queue.is_empty ()) {
-            FakeExpr expr = queue.pop_head ();
-            Vala.Symbol? member = null;
-            if (current_data_type != null) {
-                member = Vala.SemanticAnalyzer.symbol_lookup_inherited (current_data_type.type_symbol, expr.member_name);
-            } else if (ma.symbol_reference != null) {
-                member = lookup_symbol_member (ma.symbol_reference, expr.member_name);
+            } else {
+                debug ("failed to resolve expression - %s", e.message);
             }
-            ma = new Vala.MemberAccess (ma, expr.member_name);
-            ma.symbol_reference = member;
-            if (member != null) {
-                current_data_type = get_data_type (member);
-                ma.value_type = current_data_type;
-
-                if (expr.is_methodcall && member is Vala.Callable) {
-                    current_data_type = ((Vala.Callable) member).return_type;
-                    ma = new Vala.MethodCall (ma);
-                    ma.value_type = current_data_type;
-                    ((Vala.MethodCall) ma).call.value_type = get_callable_type_for_callable ((Vala.Callable) member);
-#if VALA_FEATURE_INITIAL_ARGUMENT_COUNT
-                    ((Vala.MethodCall) ma).initial_argument_count = expr.method_arguments;
-#endif
-                }
-            }
-#if !VALA_FEATURE_INITIAL_ARGUMENT_COUNT
-            this.method_arguments = expr.method_arguments;
-#endif
         }
 
-        _extracted_expression = ma;
+        if (expr is FakeMethodCall)
+            method_arguments = ((FakeMethodCall)expr).arguments_count;
+        else if (expr is FakeObjectCreationExpr && expr.inner is FakeMethodCall)
+            method_arguments = ((FakeMethodCall)((FakeObjectCreationExpr)expr).inner).arguments_count;
     }
 
     private bool skip_char (char c) {
@@ -384,17 +377,17 @@ class Vls.SymbolExtractor : Object {
     }
 
     private void skip_whitespace () {
-        while (idx > 0 && source_file.content[idx].isspace ())
+        while (idx >= 0 && source_file.content[idx].isspace ())
             idx--;
     }
 
     private string? parse_ident () {
         long lb_idx = idx;
 
-        while (lb_idx > 0 && (source_file.content[lb_idx].isalnum () || source_file.content[lb_idx] == '_'))
+        while (lb_idx >= 0 && (source_file.content[lb_idx].isalnum () || source_file.content[lb_idx] == '_'))
             lb_idx--;
 
-        if (lb_idx == idx)
+        if (lb_idx == idx || lb_idx < 0)
             return null;
 
         string ident = source_file.content.substring (lb_idx + 1, idx - lb_idx);
@@ -403,54 +396,124 @@ class Vls.SymbolExtractor : Object {
         return ident.length == 0 ? null : ident;
     }
 
+    private string? parse_string () {
+        long lb_idx = idx;
+
+        if (lb_idx < 0)
+            return null;
+        
+        if (source_file.content[lb_idx] != '"')
+            return null;
+        
+        lb_idx--;
+
+        while (lb_idx >= 0 && (source_file.content[lb_idx] != '"' || lb_idx > 0 && source_file.content[lb_idx-1] == '\\'))
+            lb_idx--;
+        
+        if (lb_idx == idx || lb_idx < 0)
+            return null;
+        
+        string str = source_file.content.substring (lb_idx + 1, idx - lb_idx - 1);
+        idx = lb_idx;   // update idx
+
+        return str.length == 0 ? null : str;
+    }
+
+    private FakeLiteral? parse_literal () {
+        string? str = parse_string ();
+        if (str != null)
+            return new FakeStringLiteral (str);
+        return null;
+    }
+
     private bool skip_member_access () {
         return skip_char ('.') || skip_string ("->");
     }
 
-    private bool skip_method_arguments (bool accept_within_method_call, out int arg_count = null) {
-        // TODO: skip arguments
+    private bool parse_expr_tuple (bool allow_no_right_paren, ArrayList<FakeExpr> expressions) {
         // allow for incomplete method call if first expression (useful for SignatureHelp)
-        arg_count = -1;
         long saved_idx = this.idx;
-        if (!skip_char (')') && !accept_within_method_call)
+        if (!skip_char (')') && !allow_no_right_paren)
             return false;
 
-        arg_count = 0;
         skip_whitespace ();
-        if (accept_within_method_call) {
+        if (allow_no_right_paren) {
             if (skip_char (','))
-                arg_count++;
+                expressions.insert (0, new FakeEmptyExpr ());
         }
         skip_whitespace ();
-        while (skip_fake_expr ()) {
-            arg_count++;
+        FakeExpr? arg = null;
+        while ((arg = parse_fake_expr (false, true)) != null) {
+            // TODO: parse cast expressions here
+            expressions.insert (0, arg);
             skip_whitespace ();
             if (skip_string ("out"))
                 skip_whitespace ();
             else if (skip_string ("ref"))
                 skip_whitespace ();
-            skip_char (',');
+            if (!skip_char (','))
+                break;
         }
         if (skip_char ('('))
             return true;
         this.idx = saved_idx;           // restore saved index 
-        arg_count = -1;
         return false;
     }
 
-    private bool skip_fake_expr () {
-        return parse_fake_expr () != null;
+    private FakeMemberAccess? parse_fake_member_access_expr (bool allow_inner_exprs = true) {
+        FakeMemberAccess? ma_expr = null;
+        string? ident;
+
+        if ((ident = parse_ident ()) != null) {
+            FakeExpr? inner = null;
+            skip_whitespace ();
+            if (skip_member_access ()) {
+                skip_whitespace ();
+                inner = allow_inner_exprs ? parse_fake_expr () : parse_fake_member_access_expr ();
+            }
+            ma_expr = new FakeMemberAccess (ident, inner);
+        }
+
+        return ma_expr;
     }
 
-    private FakeExpr? parse_fake_expr (bool accept_within_method_call = false) {
-        int method_arguments;
-        skip_method_arguments (accept_within_method_call, out method_arguments);
+    private FakeExpr? parse_fake_expr (bool accept_within_method_call = false, bool oce_allowed = false) {
+        var method_arguments = new ArrayList<FakeExpr> ();
+        bool have_tuple = parse_expr_tuple (accept_within_method_call, method_arguments);
         skip_whitespace ();
-        string? ident = parse_ident ();
+        FakeExpr? expr = parse_fake_member_access_expr ();
 
-        if (ident == null)
-            return null;
+        if (expr == null && have_tuple) {
+            if (method_arguments.size != 1)
+                return null;
+            if (!(method_arguments.first () is FakeEmptyExpr))
+                return method_arguments.first ();
+        }
+        if (expr == null && (expr = parse_literal ()) != null) {
+            return expr;
+        }
+
+        if (have_tuple)
+            expr = new FakeMethodCall (method_arguments.size, (FakeMemberAccess)expr);
         
-        return new FakeExpr (ident, method_arguments);
+        if (oce_allowed) {
+            skip_whitespace ();
+            if (parse_ident () == "new") {
+                if (have_tuple)
+                    expr = new FakeObjectCreationExpr.with_method_call ((FakeMethodCall)expr);
+                else
+                    expr = new FakeObjectCreationExpr.with_member_access ((FakeMemberAccess)expr);
+            }
+        }
+
+        return expr;
     }
+}
+
+/**
+ * Emitted by the SymbolExtractor type resolution methods
+ */
+private errordomain Vls.TypeResolutionError {
+    FIRST_EXPRESSION,
+    NTH_EXPRESSION
 }

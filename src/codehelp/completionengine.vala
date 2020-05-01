@@ -15,19 +15,10 @@ namespace Vls.CompletionEngine {
         // move back to the nearest member access if there is one
         long lb_idx = idx;
 
-        // first, move back off the end of the current line
-        if (doc.content[lb_idx] == '\n') {
+        // first, move back to an possible identifier
+        while (lb_idx > 0 && doc.content[lb_idx].isspace ())
             lb_idx--;
-            if (doc.content[lb_idx] == '\r')    // TODO: is this really necessary?
-                lb_idx--;
-        }
-
-        // now move back to an identifier
-        while (lb_idx > 0 && !doc.content[lb_idx].isalnum () 
-               && doc.content[lb_idx] != '_' && !doc.content[lb_idx-1].isspace ()
-               && doc.content[lb_idx] != '.' && !(doc.content[lb_idx-1] == '-' && doc.content[lb_idx] == '>'))
-            lb_idx--;
-
+        
         // now attempt to find a member access
         while (lb_idx >= 0 && !doc.content[lb_idx].isspace ()) {
             if (doc.content[lb_idx] == '.' || (lb_idx >= 1 && doc.content[lb_idx-1] == '-' && doc.content[lb_idx] == '>')) {
@@ -104,15 +95,14 @@ namespace Vls.CompletionEngine {
             bool in_loop;
             bool showing_override_suggestions = false;
             walk_up_current_scope (lang_serv, doc, pos, out best_scope, out nearest_symbol, out in_loop);
-            string string_at_cursor = (new SymbolExtractor (pos, doc, compilation.code_context)).extracted_string;
             if (nearest_symbol is Vala.Class) {
                 var results = gather_missing_prereqs_and_unimplemented_symbols ((Vala.Class) nearest_symbol);
                 // TODO: use missing prereqs (results.first)
-                list_implementable_symbols (lang_serv, project, doc, string_at_cursor, results.second, completions);
+                list_implementable_symbols (lang_serv, project, doc, results.second, completions);
                 showing_override_suggestions = !completions.is_empty;
             }
             if (nearest_symbol is Vala.ObjectTypeSymbol) {
-                list_implementable_symbols (lang_serv, project, doc, string_at_cursor,
+                list_implementable_symbols (lang_serv, project, doc, 
                                             gather_base_virtual_symbols ((Vala.ObjectTypeSymbol) nearest_symbol),
                                             completions);
             }
@@ -335,7 +325,7 @@ namespace Vls.CompletionEngine {
      */
     void list_implementable_symbols (Server lang_serv, Project project,
                                      Vala.SourceFile doc, 
-                                     string prefix, Gee.List<Vala.Symbol> missing_symbols,
+                                     Gee.List<Vala.Symbol> missing_symbols,
                                      Set<CompletionItem> completions) {
         foreach (var sym in missing_symbols) {
             var kind = CompletionItemKind.Method;
